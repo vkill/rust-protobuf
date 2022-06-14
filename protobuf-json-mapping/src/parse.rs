@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::num::ParseFloatError;
 use std::num::ParseIntError;
 
@@ -479,6 +480,7 @@ impl<'a> Parser<'a> {
 
     fn read_map<K, Fk, Fi>(
         &mut self,
+        kt: Option<&RuntimeType>,
         mut parse_key: Fk,
         mut read_value_and_insert: Fi,
     ) -> ParseResultWithoutLoc<()>
@@ -488,6 +490,78 @@ impl<'a> Parser<'a> {
     {
         if self.tokenizer.next_ident_if_eq("null")? {
             return Ok(());
+        }
+
+        /*
+        https://unpkg.com/google-protobuf@4.0.0-rc.2/google-protobuf.js
+        jspb.Map.prototype.toObject=function
+
+        {"fieldN1Map":[],"fieldN2Map":[],"fieldN3Map":[],"fieldN4Map":[],"fieldN5Map":[],"fieldN6Map":[]}
+        {"fieldN1Map":[[-1,"i32"]],"fieldN2Map":[[-1,"i64"]],"fieldN3Map":[[1,"u32"]],"fieldN4Map":[[1,"u64"]],"fieldN5Map":[[true,"bool"]],"fieldN6Map":[["k1","string"]]}
+        {"fieldN1Map":[[-1,"i32"],[2,"i32"]],"fieldN2Map":[[-1,"i64"],[2,"i64"]],"fieldN3Map":[[1,"u32"],[2,"u32"]],"fieldN4Map":[[1,"u64"],[2,"u64"]],"fieldN5Map":[[false,"bool"],[true,"bool"]],"fieldN6Map":[["k1","string"],["k2","string"]]}
+        */
+        if self.tokenizer.lookahead_is_symbol('[')? {
+            self.tokenizer.next_symbol_expect_eq('[', "map")?;
+
+            // empty
+            if self.tokenizer.lookahead_is_symbol(']')? {
+                self.tokenizer.next_symbol_expect_eq(']', "map")?;
+                return Ok(());
+            }
+
+            let mut first = true;
+            loop {
+                if !first {
+                    self.tokenizer.next_symbol_expect_eq(',', "map")?;
+                }
+                first = false;
+
+                self.tokenizer.next_symbol_expect_eq('[', "map")?;
+
+                let kt = if let Some(kt) = kt {
+                    kt
+                } else {
+                    match self.tokenizer.lookahead_some()? {
+                        Token::Ident(s) => match s.as_str() {
+                            "true" | "false" => &RuntimeType::Bool,
+                            _ => panic!("Token::Ident({}) cannot be a map key", s),
+                        },
+                        Token::Symbol(_) => {
+                            panic!("Token::Symbol cannot be a map key")
+                        }
+                        Token::IntLit(_) => &RuntimeType::U64,
+                        Token::FloatLit(_) => &RuntimeType::F64,
+                        Token::JsonNumber(_) => &RuntimeType::I64,
+                        Token::StrLit(_) => &RuntimeType::String,
+                    }
+                };
+
+                let key_string = match kt {
+                    RuntimeType::I32 => self.read_i32()?.to_string(),
+                    RuntimeType::I64 => self.read_i64()?.to_string(),
+                    RuntimeType::U32 => self.read_u32()?.to_string(),
+                    RuntimeType::U64 => self.read_u64()?.to_string(),
+                    RuntimeType::Bool => self.read_bool()?.to_string(),
+                    RuntimeType::String => self.read_string()?,
+                    t @ RuntimeType::F32
+                    | t @ RuntimeType::F64
+                    | t @ RuntimeType::VecU8
+                    | t @ RuntimeType::Enum(..) => panic!("{} cannot be a map key", t),
+                    RuntimeType::Message(_) => panic!("message cannot be a map key"),
+                };
+
+                let k = parse_key(self, key_string)?;
+
+                self.tokenizer.next_symbol_expect_eq(',', "map")?;
+                read_value_and_insert(self, k)?;
+
+                self.tokenizer.next_symbol_expect_eq(']', "map")?;
+
+                if self.tokenizer.lookahead_is_symbol(']')? {
+                    self.tokenizer.next_symbol_expect_eq(']', "map")?;
+                    return Ok(());
+                }
+            }
         }
 
         self.tokenizer.next_symbol_expect_eq('{', "map")?;
@@ -535,6 +609,7 @@ impl<'a> Parser<'a> {
         map.clear();
 
         self.read_map(
+            Some(kt),
             |ss, s| ss.parse_key(s, kt),
             |s, k| {
                 let v = s.read_value(vt)?;
@@ -548,6 +623,7 @@ impl<'a> Parser<'a> {
         struct_value.fields.clear();
 
         self.read_map(
+            None,
             |_, s| Ok(s),
             |s, k| {
                 let v = s.read_wk_value()?;
@@ -570,7 +646,7 @@ impl<'a> Parser<'a> {
         } else if self.tokenizer.lookahead_is_symbol('[')? {
             self.read_list(|s| s.skip_json_value())?;
         } else if self.tokenizer.lookahead_is_symbol('{')? {
-            self.read_map(|_, _| Ok(()), |s, ()| s.skip_json_value())?;
+            self.read_map(None, |_, _| Ok(()), |s, ()| s.skip_json_value())?;
         } else {
             return Err(ParseErrorWithoutLoc(
                 ParseErrorWithoutLocInner::UnexpectedToken,
@@ -666,9 +742,18 @@ impl<'a> Parser<'a> {
             }
             first = false;
 
-            let field_name = self.read_string()?;
+            let mut field_name = self.read_string()?;
             // Proto3 JSON parsers are required to accept both
             // the converted `lowerCamelCase` name and the proto field name.
+
+            if let Some(field_name_new) = self
+                .parse_options
+                .field_name_aliases
+                .get(descriptor.full_name(), &field_name)
+            {
+                field_name = field_name_new.into();
+            }
+
             match descriptor.field_by_name_or_json_name(&field_name) {
                 Some(field) => {
                     self.tokenizer.next_symbol_expect_eq(':', "object")?;
@@ -855,8 +940,29 @@ pub struct ParseOptions {
     /// When `true` fields with unknown names are ignored.
     /// When `false` parser returns an error on unknown field.
     pub ignore_unknown_fields: bool,
+    //
+    pub field_name_aliases: FieldNameAliases,
     /// Prevent initializing `ParseOptions` enumerating all field.
     pub _future_options: (),
+}
+
+//
+#[derive(Default, Debug, Clone)]
+pub struct FieldNameAliases(HashMap<String, HashMap<String, String>>);
+
+impl FieldNameAliases {
+    pub fn add(&mut self, message_full_name: &str, field_name_alias: &str, field_name: &str) {
+        self.0
+            .entry(message_full_name.into())
+            .or_insert_with(Default::default)
+            .insert(field_name_alias.into(), field_name.into());
+    }
+
+    pub fn get(&self, message_full_name: &str, field_name_alias: &str) -> Option<&str> {
+        self.0
+            .get(message_full_name)
+            .and_then(|x| x.get(field_name_alias).map(|y| y.as_ref()))
+    }
 }
 
 /// Merge JSON into provided message
